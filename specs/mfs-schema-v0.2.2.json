@@ -1,1 +1,12 @@
-
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MFS Schema",
+  "version": "0.2.2",
+  "type": "object",
+  "properties": {
+    "schema": { "type": "string", "const": "HapticScriptFormat" },
+    "version": { "type": "string" },
+    "tracks": { "type": "array" }
+  },
+  "required": ["schema", "version", "tracks"]
+}
