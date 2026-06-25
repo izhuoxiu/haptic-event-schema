@@ -277,39 +277,299 @@ public:
 
     // 重置内核（切换视频时调用）
     void reset() {
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <cstdint>
+#include <map>
+#include "json.hpp"
+#include <emscripten.h>
+#include <emscripten/val>
+
+using json = nlohmann::json;
+
+// ===================== 白皮书常量定义 =====================
+#define PRIORITY_EMOTION    5
+#define PRIORITY_MOTION     4
+#define PRIORITY_FORCE      3
+#define PRIORITY_SPACE      2
+#define PRIORITY_RHYTHM     1
+#define PRIORITY_DEFAULT    0
+
+// 模态类型，用于回调区分
+enum MfsModalType {
+    MODAL_HAPTIC = 1,
+    MODAL_RIBBON = 2,
+    MODAL_FLASH  = 3
+};
+
+// 单个MFS事件
+struct MfsEvent {
+    uint32_t time_ms;
+    uint32_t duration_ms;
+    std::string event_ref;
+    float intensity;
+    int priority;
+    json ribbon_params;
+    json flash_params;
+    json trail_params;
+    bool triggered;          // 是否已触发（用于跳转后重新触发）
+};
+
+// 轨道
+struct MfsTrack {
+    std::string track_id;
+    int priority_override;
+    std::vector<MfsEvent> events;
+};
+
+// 内核主类
+class MFS_Core {
+private:
+    std::vector<MfsTrack> track_list;
+    uint32_t last_tick_ms = 0;
+    emscripten::val js_event_callback;
+
+    // 根据编码获取基础优先级（五维铁律）
+    int get_event_base_priority(const std::string& ref) {
+        if (ref.empty()) return PRIORITY_DEFAULT;
+        char c = ref[0];
+        switch (c) {
+            case 'E': return PRIORITY_EMOTION;
+            case 'M': return PRIORITY_MOTION;
+            case 'F': return PRIORITY_FORCE;
+            case 'S': return PRIORITY_SPACE;
+            case 'R': return PRIORITY_RHYTHM;
+            default:  return PRIORITY_DEFAULT;
+        }
+    }
+
+    // 判断是否为已知标准事件（若未知则降级）
+    bool is_known_event(const std::string& ref) {
+        if (ref.length() < 2) return false;
+        char c = ref[0];
+        if (c != 'F' && c != 'R' && c != 'S' && c != 'M' && c != 'E') return false;
+        // 简单检查：第二个字符应为 '-' 且后面为数字，这里不做严格校验，直接认为格式合法即通过
+        // 但为了保险，我们可以检查是否在标准词典中（但词典较多，此处简化为只要前缀正确且长度>2）
+        return ref.length() >= 4 && ref[1] == '-';
+    }
+
+    // 对所有轨道的事件按时间排序
+    void sort_all_events() {
+        for (auto& track : track_list) {
+            std::sort(track.events.begin(), track.events.end(),
+                [](const MfsEvent& a, const MfsEvent& b) {
+                    return a.time_ms < b.time_ms;
+                });
+        }
+    }
+
+    // 重置所有事件的触发标记（用于跳转后重新触发）
+    void reset_triggered_flags() {
+        for (auto& track : track_list) {
+            for (auto& evt : track.events) {
+                evt.triggered = false;
+            }
+        }
+    }
+
+    // 触发单个模态的回调
+    void dispatch_modal(MfsModalType type, const MfsEvent& evt, const json& params = json()) {
+        if (js_event_callback.isUndefined()) return;
+        std::string params_str = params.is_null() ? "{}" : params.dump();
+        js_event_callback(static_cast<int>(type), evt.event_ref, evt.intensity, evt.duration_ms, params_str);
+    }
+
+public:
+    // 绑定JS回调
+    void set_callback(emscripten::val cb) {
+        js_event_callback = cb;
+    }
+
+    // 加载HSF脚本
+    int load_hsf_script(const std::string& hsf_json_str) {
+        try {
+            json root = json::parse(hsf_json_str);
+            track_list.clear();
+            last_tick_ms = 0;
+
+            // 检查tracks是否存在
+            if (!root.contains("tracks")) return -1;
+
+            for (auto& track_json : root["tracks"]) {
+                MfsTrack track;
+                track.track_id = track_json.contains("id") ? track_json["id"].get<std::string>() : "";
+                track.priority_override = track_json.contains("priority_override") ? track_json["priority_override"].get<int>() : -1;
+
+                if (!track_json.contains("events")) continue;
+                for (auto& evt_json : track_json["events"]) {
+                    MfsEvent evt;
+                    // 必填字段
+                    if (!evt_json.contains("time_ms") || !evt_json.contains("event_ref")) continue;
+                    evt.time_ms = evt_json["time_ms"].get<uint32_t>();
+                    evt.event_ref = evt_json["event_ref"].get<std::string>();
+
+                    // 可选字段：缺省赋合理默认值
+                    evt.intensity = evt_json.contains("intensity") ? evt_json["intensity"].get<float>() : 1.0f;
+                    evt.duration_ms = evt_json.contains("duration_ms") ? evt_json["duration_ms"].get<uint32_t>() : 0;
+
+                    // 读取多模态参数（若无则为null）
+                    evt.ribbon_params = evt_json.contains("ribbon_parameters") ? evt_json["ribbon_parameters"] : json();
+                    evt.flash_params = evt_json.contains("led_parameters") ? evt_json["led_parameters"] : json();
+                    evt.trail_params = evt_json.contains("trail_parameters") ? evt_json["trail_parameters"] : json();
+
+                    // 未知事件降级为F-101
+                    if (!is_known_event(evt.event_ref)) {
+                        evt.event_ref = "F-101";
+                    }
+
+                    // 计算优先级
+                    int base_pri = get_event_base_priority(evt.event_ref);
+                    evt.priority = (track.priority_override > 0) ? track.priority_override : base_pri;
+
+                    // 初始未触发
+                    evt.triggered = false;
+
+                    track.events.push_back(evt);
+                }
+                track_list.push_back(track);
+            }
+
+            sort_all_events();
+            reset_triggered_flags();
+            return 0;
+        } catch (const std::exception& e) {
+            return -1;
+        }
+    }
+
+    // 核心tick：每帧调用，current_ms为当前视频时间（毫秒）
+    void tick(uint32_t current_ms) {
+        // 处理跳转（向后拖动）
+        if (current_ms < last_tick_ms) {
+            // 将last_tick_ms设为current_ms - 1，以便触发当前时刻的事件
+            last_tick_ms = (current_ms > 0) ? current_ms - 1 : 0;
+            // 重置所有事件的触发标记，允许重新触发
+            reset_triggered_flags();
+        }
+
+        uint32_t start = last_tick_ms;
+        uint32_t end = current_ms;
+        last_tick_ms = current_ms;
+
+        if (start >= end) return; // 无新事件
+
+        // 收集本帧内所有候选事件
+        std::vector<MfsEvent*> haptic_candidates;
+        std::vector<MfsEvent*> ribbon_candidates;
+        std::vector<MfsEvent*> flash_candidates;
+
+        for (auto& track : track_list) {
+            for (auto& evt : track.events) {
+                if (evt.triggered) continue;              // 已经触发过的不再重复
+                if (evt.time_ms > start && evt.time_ms <= end) {
+                    // 震动总是添加（所有事件默认都触发震动）
+                    haptic_candidates.push_back(&evt);
+                    // 如果有彩带参数则加入彩带候选
+                    if (!evt.ribbon_params.is_null()) {
+                        ribbon_candidates.push_back(&evt);
+                    }
+                    // 如果有闪光灯参数则加入闪光灯候选
+                    if (!evt.flash_params.is_null()) {
+                        flash_candidates.push_back(&evt);
+                    }
+                }
+            }
+        }
+
+        // 辅助函数：按优先级降序排序，取第一个
+        auto select_highest = [](std::vector<MfsEvent*>& candidates) -> MfsEvent* {
+            if (candidates.empty()) return nullptr;
+            std::sort(candidates.begin(), candidates.end(),
+                [](const MfsEvent* a, const MfsEvent* b) {
+                    return a->priority > b->priority;
+                });
+            return candidates.front();
+        };
+
+        // 分别选出各模态最高优先级事件并触发
+        MfsEvent* best_haptic = select_highest(haptic_candidates);
+        MfsEvent* best_ribbon = select_highest(ribbon_candidates);
+        MfsEvent* best_flash = select_highest(flash_candidates);
+
+        // 触发震动（若存在）
+        if (best_haptic) {
+            best_haptic->triggered = true;
+            dispatch_modal(MODAL_HAPTIC, *best_haptic, json());
+        }
+        // 触发彩带（若存在，且可能与震动事件不同）
+        if (best_ribbon && best_ribbon != best_haptic) {
+            best_ribbon->triggered = true;
+            dispatch_modal(MODAL_RIBBON, *best_ribbon, best_ribbon->ribbon_params);
+        }
+        // 触发闪光灯（若存在，且可能与前面不同）
+        if (best_flash && best_flash != best_haptic && best_flash != best_ribbon) {
+            best_flash->triggered = true;
+            dispatch_modal(MODAL_FLASH, *best_flash, best_flash->flash_params);
+        }
+
+        // 注意：如果最佳事件相同，我们只触发一次，但它的参数可能同时包含多个模态，
+        // 但我们的dispatch_modal只触发指定模态，所以如果同一个事件同时是最佳震动和最佳彩带，
+        // 我们会在震动中触发一次，彩带中再触发一次（但可能重复参数）。为了避免重复，
+        // 我们可以在触发震动时，如果该事件也有彩带/闪光灯，我们也可以一并触发，
+        // 但为了逻辑清晰，我们统一按分组触发，但标记triggered避免重复计数。
+        // 如果最佳震动和最佳彩带是同一个事件，我们会在震动触发后标记为triggered，然后再检查彩带时，
+        // 由于我们已经标记了，但我们的选择是在标记之前，所以没问题。但是我们在触发震动后，
+        // 再触发彩带时，该事件已经被标记，但我们已经选出了指针，所以可以直接触发。
+        // 然而，我们可能重复触发同一事件的彩带和震动，如果它同时是两者最佳。
+        // 这是允许的，因为事件本身就包含多个模态，我们分别触发即可。
+        // 但如果事件同时是最佳震动和最佳彩带，我们触发两次dispatch_modal，一次震动，一次彩带，
+        // 这对上层是两次回调，但事件本身应该一次触发多个模态，可能更合理。
+        // 为了简化，我们可以让dispatch_modal只触发指定模态，如果事件同时包含多个模态，
+        // 可以分别调用。或者我们可以在触发震动时，如果事件有彩带/闪光灯参数，就一并触发所有模态。
+        // 白皮书要求不同模态可以独立触发，所以分别触发是合理的。
+        // 但为了减少重复回调，我们可以修改：当best_haptic存在且同时有彩带/闪光灯参数时，我们直接一次性触发所有模态。
+        // 但为了代码简单，保持分别触发。
+    }
+
+    // 重置内核（清空所有状态）
+    void reset() {
         track_list.clear();
         last_tick_ms = 0;
+        // 无需重置triggered因为清空了
     }
 };
 
-// 全局唯一内核实例
+// 全局内核实例
 static MFS_Core g_mfs_core;
 
-// ===================== 导出给JS调用的全局函数（EMSCRIPTEN_KEEPALIVE不可删） =====================
-// 1. 注册JS事件回调
+// ===================== 导出给JavaScript的接口 =====================
+extern "C" {
+
 EMSCRIPTEN_KEEPALIVE
 void mfs_set_callback(emscripten::val js_cb) {
     g_mfs_core.set_callback(js_cb);
 }
 
-// 2. 加载HSF脚本字符串
 EMSCRIPTEN_KEEPALIVE
 int mfs_load_script(const char* json_str) {
+    if (!json_str) return -1;
     std::string s(json_str);
     return g_mfs_core.load_hsf_script(s);
 }
 
-// 3. 视频帧时间推送tick（核心调度入口）
 EMSCRIPTEN_KEEPALIVE
 void mfs_tick(uint32_t current_ms) {
     g_mfs_core.tick(current_ms);
 }
 
-// 4. 重置内核
 EMSCRIPTEN_KEEPALIVE
 void mfs_reset() {
     g_mfs_core.reset();
 }
+
+} // extern "C"
  
  
 第三部分：一键编译脚本（Windows / Mac分开）
