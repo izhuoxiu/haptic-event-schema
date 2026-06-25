@@ -1,5 +1,5 @@
 # Multimodal Feedback Schema (MFS)
-点击查看完整白皮书：[v0.2.3 技术规范](./multimodal-feedback-schema.md)
+点击查看完整白皮书：[v0.2.3 技术规范](./https://github.com/izhuoxiu/MFS/blob/main/docs/MFS%E5%A4%9A%E6%A8%A1%E6%80%81%E5%8F%8D%E9%A6%88%E7%B3%BB%E7%BB%9F%E7%99%BD%E7%9A%AE%E4%B9%A6V0.2.3.md)
 MFS多模态反馈系统白皮书
  
 >核心标语：MFS未来可及，此刻正发生
